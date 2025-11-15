@@ -1,0 +1,408 @@
+---
+title: "Hmw_3"
+author: "Elena Melkonyan"
+date: "2025-11-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#AFT model (EXP, WEIBULL, LNORM, LLOGIS)
+
+libs <- c("survival", "flexsurv", "dplyr", "ggplot2")
+new_libs <- libs[!(libs %in% installed.packages()[, "Package"])]
+if (length(new_libs) > 0) install.packages(new_libs)
+invisible(lapply(libs, library, character.only = TRUE))
+
+#Load data
+telco <- read.csv("telco.csv", stringsAsFactors = TRUE)
+
+telco$churn <- ifelse(telco$churn == "Yes", 1, 0)
+surv_obj <- Surv(time = telco$tenure, event = telco$churn)
+
+#Choose a reasonable formula (only with variables that exist in telco.csv)
+aft_formula <- surv_obj ~ age + income + gender + internet + forward + custcat
+
+#Fit AFT models with 4 distributions
+dists <- c("exp", "weibull", "lnorm", "llogis")
+pretty_names <- c("Exponential", "Weibull", "Lognormal", "Log-logistic")
+
+aft_models <- lapply(dists, function(d) {
+  flexsurvreg(aft_formula, data = telco, dist = d)
+})
+names(aft_models) <- pretty_names
+
+#AIC comparison
+aic_results <- sapply(aft_models, AIC)
+print(aic_results)
+
+newdata_ref <- data.frame(
+  age     = mean(telco$age, na.rm = TRUE),
+  income  = mean(telco$income, na.rm = TRUE),
+  gender  = levels(telco$gender)[1],
+  internet = levels(telco$internet)[1],
+  forward  = levels(telco$forward)[1],
+  custcat  = levels(telco$custcat)[1]
+)
+
+#Survival curves for each model
+time_grid <- seq(1, max(telco$tenure, na.rm = TRUE), by = 1)
+
+surv_curves_list <- lapply(names(aft_models), function(model_name) {
+  model <- aft_models[[model_name]]
+  s <- summary(model, newdata = newdata_ref,
+               t = time_grid, type = "survival")[[1]]
+  data.frame(
+    time = time_grid,
+    surv = s$est,
+    model = model_name
+  )
+})
+
+surv_curves <- do.call(rbind, surv_curves_list)
+
+#Plotting
+ggplot(surv_curves, aes(x = time, y = surv, color = model)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Survival Curves for AFT Models (Different Distributions)",
+    x = "Tenure (months)",
+    y = "Survival Probability",
+    color = "Model"
+  ) +
+  theme_minimal()
+
+```
+The Telco dataset contains demographic attributes (age, income, gender), service usage features (internet, call forwarding), and customer categories (E-service, Plus service, Total service). 
+The survival outcome is defined as:
+Time variable: customer tenure in months
+Event variable: churn indicator (1 = churned, 0 = censored)
+
+I estimate AFT models with four commonly used distributions: 
+Those are → Exponential, Weibull, Lognormal, Log-logistic
+Model fit is assessed using the Akaike Information Criterion (AIC).
+The model with the lowest AIC is selected for interpretation and CLV forecasting.
+
+Based on the AIC comparison of four alternative AFT models the Lognormal distribution provides the best fit to the Telco churn data. 
+It produces the lowest AIC value (2988.948), indicating that it achieves the most favorable balance between model accuracy and complexity.
+Therefore, the Lognormal AFT model is selected as our final specification for subsequent interpretation and CLV estimation.
+
+
+```{r}
+best_dist <- "lnorm"   
+aft_full <- flexsurvreg(
+  surv_obj ~ age + income + gender + internet + forward + custcat,
+  data = telco,
+  dist = best_dist
+)
+
+summary(aft_full)
+
+```
+Interpretation of AFT Coefficients:
+Positive coefficient → increases survival time → customer stays longer → lower churn risk
+Negative coefficient → decreases survival time → customer churns sooner
+Model has all positive coefficients — meaning each included variable is associated with longer customer lifetime relative to the baseline.
+
+Age
+The coefficient for age is positive, indicating that older customers tend to remain subscribed longer. 
+As age increases, expected tenure increases, meaning older subscribers are less likely to churn in the short term.
+
+Income
+Income has a positive coefficient, suggesting that higher-income customers have longer survival times. 
+This implies that these customers are more stable, generating more predictable recurring revenue.
+
+Gender (Male vs Female)
+The estimate for male customers is positive, meaning that—on average—males exhibit longer survival times compared to the baseline gender category. 
+This suggests lower churn likelihood among male subscribers.
+
+Internet Service (Yes vs No)
+Subscribers with internet services added to their telecom package show longer expected tenure. 
+Bundled service customers typically face higher switching costs and are therefore less likely to churn.
+
+Forwarding Service
+Customers using call-forwarding features also have increased survival times. 
+This supports the idea that customers who rely on additional features are more embedded in the service ecosystem and churn less frequently.
+
+Customer Category (E-service, Plus service, Total service vs Base)
+All customer-category coefficients are positive: Thus they all have longer survival.
+
+Compared to the baseline customer category, all upgraded service tiers demonstrate significantly longer expected survival times. 
+This indicates that more comprehensive subscription bundles are associated with improved retention.
+
+Summary
+The Lognormal AFT model indicates that demographic and service-related variables have meaningful associations with customer lifetime. 
+All included predictors have positive coefficients, meaning they increase survival time relative to the baseline category. 
+Older and higher-income customers show longer expected tenure, as do male subscribers. Customers who subscribe to Internet, call-forwarding, or premium service tiers exhibit longer survival as well, suggesting that multi-service adoption meaningfully reduces churn. These findings align with marketing intuition: customers with stronger product attachment or more integrated service packages tend to remain subscribed for longer periods.
+
+
+
+```{r}
+margin <- 12                 # monthly margin based on slides
+discount_rate <- 0.12 / 12   # yearly 12% ➜ monthly discount
+best_dist <- "lnorm"         # from AIC results
+
+aft_final <- flexsurvreg(
+  surv_obj ~ age + income + gender + internet + forward + custcat,
+  data = telco,
+  dist = best_dist
+)
+
+summary(aft_final)
+
+#Survival matrix for each customer
+
+max_month <- max(telco$tenure, na.rm = TRUE)
+time_grid <- 1:max_month
+
+surv_list <- lapply(1:nrow(telco), function(i){
+  summary(aft_final, newdata = telco[i, ],
+          t = time_grid, type = "survival")[[1]]$est
+})
+
+# Convert list → matrix
+surv_matrix <- do.call(rbind, surv_list)
+colnames(surv_matrix) <- paste0("t", time_grid)
+
+df <- (1 / (1 + discount_rate)) ^ time_grid   # monthly discounting
+
+#CLV calculation
+clv <- surv_matrix %*% (margin * df)
+clv <- as.numeric(clv)
+
+telco$CLV <- clv
+
+head(telco$CLV)
+
+#Distribution plot
+library(ggplot2)
+
+ggplot(telco, aes(x = CLV)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Customer Lifetime Value",
+    x = "CLV (dollars)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+#CLV by customer category
+ggplot(telco, aes(x = custcat, y = CLV, fill = custcat)) +
+  geom_boxplot() +
+  labs(
+    title = "CLV by Customer Category",
+    x = "Customer Category",
+    y = "CLV"
+  ) +
+  theme_minimal()
+
+```
+
+Customer Lifetime Value (CLV) was calculated using the formula where:
+
+m=12 is the monthly margin (based on the slide example of $20 revenue and $8 cost per month),
+Si(t)  is the predicted Lognormal survival probability for customer i at month t, obtained from the final AFT model,
+d=0.01 is the monthly discount rate (12% annual),
+T=72 is the maximum tenure horizon in the data (72 months).
+
+Using the survival matrix generated from the AFT model, this formula is applied to each of the 1,000 subscribers, producing an individual CLV estimate. The resulting CLV values for the first few customers are in the range of roughly $400–$600, which is consistent with the idea that most subscribers generate several years of profitable relationship under the current churn dynamics.
+
+
+CLV Results and Interpretation: 
+
+The CLV histogram shows values ranging approximately from just below $200 to a little over $600, with most customers concentrated in the $400–$600 range. The distribution is therefore left–skewed: only a small group of subscribers has very low CLV, while the majority have relatively high expected value. This pattern reflects the fairly high survival probabilities observed over the 72-month horizon, where the probability of still being active after the first year remains close to one.
+
+The boxplot of CLV by customer category reveals clear differences in profitability across segments. Basic service customers have the lowest median CLV and the widest spread of lower values, indicating higher churn risk and weaker long-term contribution. E-service and especially Plus service customers show the highest median CLV, confirming that upgraded service tiers with more features and functionality create more valuable, longer-lasting relationships. Total service customers also have higher CLV than the basic group, but with more dispersion, suggesting a mix of very valuable and more fragile subscribers within this tier. Overall, CLV patterns are fully consistent with the survival analysis: segments with longer predicted lifetimes (older, higher-income, multi-service subscribers) also generate the highest lifetime value and should be prioritized in retention and cross-sell strategies.
+
+
+```{r}
+#Survival at 12 months for each customer
+time_1y <- 12
+
+S12_vec <- sapply(1:nrow(telco), function(i) {
+  summary(
+    aft_final,
+    newdata = telco[i, ],
+    t = time_1y,
+    type = "survival"
+  )[[1]]$est
+})
+
+telco$S12 <- S12_vec
+
+#One-year CLV (first 12 months only)
+time_grid_1y <- 1:12
+df_1y <- (1 / (1 + discount_rate)) ^ time_grid_1y
+
+surv_list_1y <- lapply(1:nrow(telco), function(i) {
+  summary(
+    aft_final,
+    newdata = telco[i, ],
+    t = time_grid_1y,
+    type = "survival"
+  )[[1]]$est
+})
+
+surv_mat_1y <- do.call(rbind, surv_list_1y)
+clv_1y <- surv_mat_1y %*% (margin * df_1y)
+telco$CLV_1y <- as.numeric(clv_1y)
+
+#At-risk customers: S(12) < 0.60
+
+threshold <- 0.60
+
+telco$at_risk <- telco$S12 < threshold & telco$CLV_1y > 0
+
+n_risk <- sum(telco$at_risk)
+total_clv_risk <- sum(telco$CLV_1y[telco$at_risk])
+
+
+fmt_dollar <- function(x) format(round(x, 2), nsmall = 2, big.mark = ",")
+fmt_pct <- function(x) paste0(round(x * 100, 1), " %")
+
+#Summary values
+n_total <- nrow(telco)
+pct_risk <- n_risk / n_total
+avg_clv_risk <- ifelse(n_risk > 0, total_clv_risk / n_risk, 0)
+
+#Print results 
+cat("------------------------------------------------------------\n")
+cat("           At-Risk Customers (S(12) <", threshold, ")\n")
+cat("------------------------------------------------------------\n")
+cat("Number of at-risk customers:        ", n_risk, "\n")
+cat("Percentage of total customers:      ", fmt_pct(pct_risk), "\n")
+cat("Total 1-year CLV at risk:          $", fmt_dollar(total_clv_risk), "\n")
+cat("Average CLV of at-risk customers:  $", fmt_dollar(avg_clv_risk), "\n")
+cat("\n")
+
+
+# Retention Budget Analysis
+
+# Set the assumed retention cost per customer
+cost_per_customer <- 100   # you can change this
+
+# Total budget needed to attempt saving all at-risk customers
+total_budget_needed <- n_risk * cost_per_customer
+
+# ROI calculation if retention succeeds
+roi <- ifelse(total_budget_needed > 0,
+              (total_clv_risk - total_budget_needed) / total_budget_needed,
+              NA)
+
+#Print results 
+cat("------------------------------------------------------------\n")
+cat("                Retention Budget Analysis\n")
+cat("------------------------------------------------------------\n")
+cat("Assumed retention cost per customer: $", cost_per_customer, "\n")
+cat("Total retention budget needed:       $", fmt_dollar(total_budget_needed), "\n")
+cat("CLV at risk:                        $", fmt_dollar(total_clv_risk), "\n")
+cat("ROI if retention succeeds:           ", fmt_pct(roi), "\n")
+cat("------------------------------------------------------------\n")
+
+```
+Conclusion
+
+The retention budget analysis shows that 27 customers fall into the at-risk segment under the criterion S(12)<0.60, 
+representing 2.7% of the subscriber base. However, this group has a very low economic value: their combined one-year CLV is only $2,555.49, with an average of just $94.65 per customer. Because the assumed retention cost is $100 per customer, attempting to retain all at-risk customers would require $2,700, which exceeds the total CLV recoverable from this segment. As a result, the expected ROI becomes negative (−5.4%), indicating that investing in expensive retention incentives for these particular customers is not financially justified.
+
+These results imply that the company should avoid high-cost retention actions for this low-value at-risk segment and instead rely on low-touch, inexpensive communication (e.g., automated reminders, generic email outreach) while prioritizing investments toward customers with higher CLV and stronger long-term profitability potential.
+
+
+CLV by Customer Category
+```{r}
+telco %>%
+  group_by(custcat) %>%
+  summarise(
+    mean_CLV = mean(CLV),
+    median_CLV = median(CLV),
+    count = n()
+  ) %>%
+  arrange(desc(mean_CLV))
+```
+The CLV results show that the most valuable segments are Plus service and E-service customers, who generate the highest lifetime value. 
+Total service customers form a mid-value group, while Basic service subscribers are the least valuable. 
+This confirms that multi-service and premium-tier users drive the greatest long-term profitability.
+
+
+
+CLV by gender
+```{r}
+telco %>%
+  group_by(gender) %>%
+  summarise(
+    mean_CLV   = mean(CLV),
+    median_CLV = median(CLV),
+    count      = n()
+  ) %>%
+  arrange(desc(mean_CLV))
+```
+CLV by gender shows that female customers have higher lifetime value than male customers on average. This indicates that female subscribers tend to stay longer or generate more monthly margin, making them a comparatively more valuable segment for long-term retention and marketing focus.
+
+
+
+CLV by income quartile 
+```{r}
+telco %>%
+  mutate(income_group = ntile(income, 4)) %>%
+  group_by(income_group) %>%
+  summarise(mean_CLV = mean(CLV)) %>%
+  arrange(desc(mean_CLV))
+```
+CLV increases strongly with income: customers in the highest income quartile generate the greatest lifetime value, while those in the lowest income groups have substantially lower CLV. This indicates that higher-income subscribers tend to stay longer and produce more long-term revenue, making them one of the most valuable demographic segments.
+
+
+
+CLV by age group
+```{r}
+telco %>%
+  mutate(age_group = cut(age, breaks = c(0,30,50,80), labels=c("young","mid","senior"))) %>%
+  group_by(age_group) %>%
+  summarise(mean_CLV = mean(CLV)) %>%
+  arrange(desc(mean_CLV))
+```
+CLV increases sharply with age: senior customers have by far the highest lifetime value, mid-age customers form a moderate-value group, and young subscribers have the lowest CLV. This indicates that older customers tend to stay longer and generate significantly higher long-term revenue, making them one of the most valuable demographic segments.
+
+
+
+Combined model: which features predict highest CLV
+```{r}
+summary(lm(clv ~ age + income + gender + internet + forward + custcat, data = telco))
+```
+The combined regression model shows that age, income, male gender, Forward service, and all premium customer categories (E-service, Plus, Total) significantly increase CLV, while Internet-only customers exhibit lower CLV. Nearly all predictors are highly significant and the model explains 94% of CLV variation, confirming that demographic factors and service upgrades are the strongest drivers of lifetime value.
+
+
+
+Interpretation of Coefficients
+
+The Log-normal AFT model shows that churn risk decreases for older and higher-income customers, as well as for subscribers using Internet, Forwarding, and premium-tier services (E-service, Plus, Total). These factors significantly extend expected survival time. Gender has a smaller effect, with males showing slightly longer predicted retention, though this effect is weaker than other variables. Premium service usage and higher customer engagement remain the strongest predictors of longer lifetimes.
+
+Most Valuable Segments
+
+Valuable segments are those combining long expected survival with high CLV. The highest-value groups include Plus, E-service, and Total service customers, as well as higher-income and senior-age subscribers, who consistently show the highest CLV. Even though males have marginally longer predicted retention, female subscribers generate higher CLV overall, indicating stronger monthly revenue contribution. Premium-tier and higher-income customers therefore represent the most profitable long-term segments.
+
+Annual Retention Budget Estimation
+
+Based on a $12 monthly margin and a 1% monthly discount rate, 27 customers fall below the S(12) < 0.60 threshold, representing 2.7% of the base. Their combined one-year CLV equals $2,555.49. Retaining all at-risk customers at a cost of $100 each would require $2,700, producing an ROI of –5.4%, meaning high-cost retention efforts for this group are not financially justified. Low-cost automated communication is more appropriate for this segment.
+
+Recommendations for Retention Strategy
+
+Retention investments should focus on premium-tier, higher-income, and older subscribers, where incentives, personalized messaging, or loyalty benefits are more cost-effective. Younger, lower-income, and Basic-tier users benefit more from lighter interventions such as guided onboarding, small promotional incentives, or targeted upgrade recommendations. Increasing adoption of bundled services remains a key strategy, as multi-service usage strongly boosts both retention and CLV. Integrating survival-based churn probabilities and CLV scores into CRM systems will further improve targeting efficiency and ongoing risk detection.
+
+Conclusion
+
+Together, survival analysis and CLV estimation highlight the factors that reduce churn and identify the customer groups that drive long-term profitability. Premium-tier participation, higher income, and older age significantly extend customer lifetime and increase value, while low-value at-risk customers should not receive costly retention spending. Directing retention resources toward high-value segments and applying cost-efficient measures for vulnerable groups strengthens overall customer management and profitability.
+
+
+
+
+
+
+
+
+
+
+
+
